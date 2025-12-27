@@ -15,18 +15,21 @@
 #include <DallasTemperature.h>
 
 // Configuración WiFi
-const char* ssid = "MERCUSYS_57B9";
-const char* password = "96552333Aa";
+const char* ssid = "belkin.3f0";
+const char* password = "6e4496f6";
 
 // Configuración IP estática
-IPAddress local_IP(192, 168, 0, 110);      // IP fija deseada
-IPAddress gateway(192, 168, 0, 1);         // Gateway (router)
+IPAddress local_IP(192, 168, 2, 110);      // IP fija deseada
+IPAddress gateway(192, 168, 2, 1);         // Gateway (router)
 IPAddress subnet(255, 255, 255, 0);        // Máscara de subred
 IPAddress primaryDNS(8, 8, 8, 8);          // DNS primario (Google)
 IPAddress secondaryDNS(8, 8, 4, 4);        // DNS secundario (Google)
 
 // Pin donde están conectados los sensores DS18B20 (ambos en el mismo bus)
 #define ONE_WIRE_BUS 4  // GPIO4 (D2 en NodeMCU)
+
+// *** CONFIGURACIÓN DE NÚMERO DE SENSORES ***
+#define NRO_SENSORES 1  // Cambia este valor según el número de sensores que uses (1 o 2)
 
 // Configurar OneWire para los sensores
 OneWire oneWire(ONE_WIRE_BUS);
@@ -56,16 +59,22 @@ void updateTemperature() {
     sensor1Error = true;
   }
   
-  // Leer sensor 2 (si existe)
-  if (numSensors >= 2) {
-    temperature2C = sensors.getTempCByIndex(1);
-    if (temperature2C != DEVICE_DISCONNECTED_C && temperature2C < 85.0 && temperature2C > -55.0) {
-      sensor2Error = false;
+  // Leer sensor 2 solo si NRO_SENSORES >= 2
+  if (NRO_SENSORES >= 2) {
+    if (numSensors >= 2) {
+      temperature2C = sensors.getTempCByIndex(1);
+      if (temperature2C != DEVICE_DISCONNECTED_C && temperature2C < 85.0 && temperature2C > -55.0) {
+        sensor2Error = false;
+      } else {
+        sensor2Error = true;
+      }
     } else {
       sensor2Error = true;
     }
   } else {
+    // Si NRO_SENSORES = 1, marcar sensor2 como no usado
     sensor2Error = true;
+    temperature2C = 0.0;
   }
   
   lastUpdate = millis();
@@ -122,18 +131,21 @@ void handleRoot() {
     html += "</div>";
   }
   
-  // Sensor 2
-  if (!sensor2Error) {
-    html += "<div class='sensor-card' style='margin-top: 15px;'>";
-    html += "<div>Sensor 2 (D1)</div>";
-    html += "<div class='temperature'>" + String(temperature2C, 1) + "<span class='unit'>°C</span></div>";
-    html += "</div>";
-  } else {
-    html += "<div class='error' style='margin-top: 15px;'>";
-    html += "<h2Conecta ambos sensores DATA al pin D2</p>";
-    html += "<p>Cada uno con su resistencia 4.7kΩ4.7kΩ</p>";
-    html += "<p>Revisa las conexiones DATA en D1</p>";
-    html += "</div>";
+  // Sensor 2 - Solo mostrar si NRO_SENSORES >= 2
+  if (NRO_SENSORES >= 2) {
+    if (!sensor2Error) {
+      html += "<div class='sensor-card' style='margin-top: 15px;'>";
+      html += "<div>Sensor 2 (D2)</div>";
+      html += "<div class='temperature'>" + String(temperature2C, 1) + "<span class='unit'>°C</span></div>";
+      html += "</div>";
+    } else {
+      html += "<div class='error' style='margin-top: 15px;'>";
+      html += "<h2>⚠️ Error Sensor 2</h2>";
+      html += "<p>Conecta ambos sensores DATA al pin D2</p>";
+      html += "<p>Cada uno con su resistencia 4.7kΩ</p>";
+      html += "<p>Revisa las conexiones</p>";
+      html += "</div>";
+    }
   }
   
   html += "</div>";
@@ -142,7 +154,8 @@ void handleRoot() {
   html += "<div class='info-row'><span class='label'>Estado WiFi:</span><span class='value'>Conectado</span></div>";
   html += "<div class='info-row'><span class='label'>Red:</span><span class='value'>" + String(ssid) + "</span></div>";
   html += "<div class='info-row'><span class='label'>IP:</span><span class='value'>" + WiFi.localIP().toString() + "</span></div>";
-  html += "<div class='info-row'><span class='label'>Sensores activos:</span><span class='value'>" + String(numSensors) + "</span></div>";
+  html += "<div class='info-row'><span class='label'>Sensores configurados:</span><span class='value'>" + String(NRO_SENSORES) + "</span></div>";
+  html += "<div class='info-row'><span class='label'>Sensores detectados:</span><span class='value'>" + String(numSensors) + "</span></div>";
   html += "<div class='info-row'><span class='label'>Última lectura:</span><span class='value'>" + String((millis() - lastUpdate) / 1000) + "s</span></div>";
   html += "</div>";
   
@@ -158,7 +171,8 @@ void handleAPI() {
   updateTemperature();
   
   String json = "{";
-  json += "\"numSensors\": " + String(numSensors) + ",";
+  json += "\"nroSensoresConfig\": " + String(NRO_SENSORES) + ",";
+  json += "\"numSensorsDetected\": " + String(numSensors) + ",";
   json += "\"timestamp\": " + String(millis()) + ",";
   
   // Sensor 1
@@ -172,16 +186,18 @@ void handleAPI() {
   }
   json += "}";
   
-  // Sensor 2
-  json += ",\"sensor2\": {";
-  if (sensor2Error) {
-    json += "\"error\": true,";
-    json += "\"temperature\": null";
-  } else {
-    json += "\"error\": false,";
-    json += "\"temperature\": " + String(temperature2C, 2);
+  // Sensor 2 - Solo incluir si NRO_SENSORES >= 2
+  if (NRO_SENSORES >= 2) {
+    json += ",\"sensor2\": {";
+    if (sensor2Error) {
+      json += "\"error\": true,";
+      json += "\"temperature\": null";
+    } else {
+      json += "\"error\": false,";
+      json += "\"temperature\": " + String(temperature2C, 2);
+    }
+    json += "}";
   }
-  json += "}";
   
   json += "}";
   
@@ -208,6 +224,17 @@ void handleSensor1() {
 
 // API endpoint para sensor 2
 void handleSensor2() {
+  // Solo permitir acceso si NRO_SENSORES >= 2
+  if (NRO_SENSORES < 2) {
+    String json = "{";
+    json += "\"error\": true,";
+    json += "\"message\": \"Sensor 2 no está configurado (NRO_SENSORES=1)\",";
+    json += "\"temperature\": null";
+    json += "}";
+    server.send(400, "application/json", json);
+    return;
+  }
+  
   updateTemperature();
   
   String json = "{";
@@ -229,8 +256,13 @@ void handleSimple() {
   updateTemperature();
   
   String json = "{";
-  json += "\"temp1\": " + String(sensor1Error ? 0 : temperature1C, 2) + ",";
-  json += "\"temp2\": " + String(sensor2Error ? 0 : temperature2C, 2);
+  json += "\"temp1\": " + String(sensor1Error ? 0 : temperature1C, 2);
+  
+  // Solo incluir temp2 si NRO_SENSORES >= 2
+  if (NRO_SENSORES >= 2) {
+    json += ",\"temp2\": " + String(sensor2Error ? 0 : temperature2C, 2);
+  }
+  
   json += "}";
   
   server.send(200, "application/json", json);
@@ -248,17 +280,21 @@ void setup() {
   
   Serial.println("\n\nESP8266 - Sensor DS18B20 con Web Server");
   Serial.println("========================================");
-  ("/api/sensor1", handleSensor1);
-  server.on("/api/sensor2", handleSensor2);
-  server.on("/api/simple", handleSimple);
-  server.on
+  
   // Inicializar los sensores DS18B20
   Serial.println("Iniciando sensores...");
   sensors.begin();
   
   Serial.println("Configuración:");
-  Serial.println("- Ambos sensores conectados a D2 (GPIO4)");
-  Serial.println("- Cada sensor con su resistencia pull-up 4.7kΩ");
+  Serial.print("- Número de sensores configurado: ");
+  Serial.println(NRO_SENSORES);
+  if (NRO_SENSORES == 1) {
+    Serial.println("- 1 sensor conectado a D2 (GPIO4)");
+    Serial.println("- Resistencia pull-up 4.7kΩ entre DATA y VCC");
+  } else {
+    Serial.println("- Sensores conectados a D2 (GPIO4)");
+    Serial.println("- Cada sensor con su resistencia pull-up 4.7kΩ");
+  }
   Serial.print("- Sensores detectados: ");
   Serial.println(sensors.getDeviceCount());
   
@@ -299,16 +335,22 @@ void setup() {
   // Configurar rutas del servidor web
   server.on("/", handleRoot);
   server.on("/api/temperature", handleAPI);
+  server.on("/api/sensor1", handleSensor1);
+  server.on("/api/sensor2", handleSensor2);
+  server.on("/api/simple", handleSimple);
   server.onNotFound(handleNotFound);
   
-  // Iniciar servi\nEndpoints API disponibles:");
-  Serial.println("- http://" + WiFi.localIP().toString() + "/api/temperature (ambos sensores)");
-  Serial.println("- http://" + WiFi.localIP().toString() + "/api/sensor1 (solo sensor 1)");
-  Serial.println("- http://" + WiFi.localIP().toString() + "/api/sensor2 (solo sensor 2)");
-  Serial.println("- http://" + WiFi.localIP().toString() + "/api/simple (formato simple)");
-  Serial.println("dor
+  // Iniciar servidor
   server.begin();
   Serial.println("Servidor web iniciado");
+  Serial.println("\nEndpoints API disponibles:");
+  Serial.println("- http://" + WiFi.localIP().toString() + " (interfaz web)");
+  Serial.println("- http://" + WiFi.localIP().toString() + "/api/temperature (datos completos)");
+  Serial.println("- http://" + WiFi.localIP().toString() + "/api/sensor1 (solo sensor 1)");
+  if (NRO_SENSORES >= 2) {
+    Serial.println("- http://" + WiFi.localIP().toString() + "/api/sensor2 (solo sensor 2)");
+  }
+  Serial.println("- http://" + WiFi.localIP().toString() + "/api/simple (formato simple)");
   Serial.println("========================================\n");
   
   // Primera lectura de temperatura
@@ -335,12 +377,15 @@ void loop() {
       Serial.println("Sensor 1 (D2): Error de lectura");
     }
     
-    if (!sensor2Error) {
-      Serial.print("Sensor 2 (D2): ");
-      Serial.print(temperature2C, 1);
-      Serial.println(" °C");
-    } else {
-      Serial.println("Sensor 2 (D2): No detectado - conecta ambos al pin D2");
+    // Solo mostrar sensor 2 si está configurado
+    if (NRO_SENSORES >= 2) {
+      if (!sensor2Error) {
+        Serial.print("Sensor 2 (D2): ");
+        Serial.print(temperature2C, 1);
+        Serial.println(" °C");
+      } else {
+        Serial.println("Sensor 2 (D2): No detectado");
+      }
     }
     
     Serial.println("---");
