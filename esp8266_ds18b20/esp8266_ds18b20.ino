@@ -82,6 +82,10 @@ void updateTemperature() {
 
 // Página web principal con diseño moderno
 void handleRoot() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
   String html = "<!DOCTYPE html><html lang='es'><head>";
   html += "<meta charset='UTF-8'>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
@@ -168,6 +172,10 @@ void handleRoot() {
 
 // API endpoint para obtener datos JSON
 void handleAPI() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
   updateTemperature();
   
   String json = "{";
@@ -206,6 +214,10 @@ void handleAPI() {
 
 // API endpoint para sensor 1
 void handleSensor1() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
   updateTemperature();
   
   String json = "{";
@@ -224,6 +236,10 @@ void handleSensor1() {
 
 // API endpoint para sensor 2
 void handleSensor2() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
   // Solo permitir acceso si NRO_SENSORES >= 2
   if (NRO_SENSORES < 2) {
     String json = "{";
@@ -253,6 +269,10 @@ void handleSensor2() {
 
 // API endpoint simple - solo temperaturas
 void handleSimple() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
   updateTemperature();
   
   String json = "{";
@@ -270,6 +290,10 @@ void handleSimple() {
 
 // Página 404
 void handleNotFound() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  
   server.send(404, "text/plain", "404: Página no encontrada");
 }
 
@@ -327,6 +351,20 @@ void setup() {
     Serial.println(WiFi.localIP());
     Serial.print("Accede al servidor web en: http://");
     Serial.println(WiFi.localIP());
+    
+    // *** OPTIMIZACIÓN DE ENERGÍA WIFI ***
+    // Reducir potencia de transmisión (rango: 0-20.5 dBm)
+    // 15 dBm es suficiente para distancias cortas/medias y reduce el calor
+    WiFi.setOutputPower(15);  // Ajusta entre 10-20 según tu distancia al router
+    
+    // Habilitar modo de ahorro de energía del módem
+    // Mantiene conectividad pero reduce consumo entre transmisiones
+    WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+    
+    Serial.println("\nOptimización de energía activada:");
+    Serial.println("- Potencia WiFi: 15 dBm (reducida)");
+    Serial.println("- Modo ahorro: MODEM_SLEEP");
+    Serial.println("- Esto reduce el calentamiento sin perder conectividad");
   } else {
     Serial.println("Error: No se pudo conectar a WiFi");
     Serial.println("Verifica el SSID y la contraseña");
