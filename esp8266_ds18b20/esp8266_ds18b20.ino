@@ -158,6 +158,7 @@ float lastPublishedTemp2 = NAN;
 
 void logInfo(const String& msg) { Serial.println("[INFO] " + msg); }
 void logWarn(const String& msg) { Serial.println("[WARN] " + msg); }
+void logError(const String& msg) { Serial.println("[ERROR] " + msg); }
 
 void setCors() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
