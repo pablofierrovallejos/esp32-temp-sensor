@@ -1,395 +1,479 @@
 /*
- * ESP32-S3 - Sensor de Temperatura DS18B20 con Web Server
- * Dos sensores en el mismo pin (bus OneWire)
- * 
- * Librerías necesarias:
- * - OneWire
- * - DallasTemperature
- * - WiFi (incluida en el core de ESP32)
- * - WebServer (incluida en el core de ESP32)
+ * ESP32-S3 - Sensor DS18B20 con HTTP + MQTT
+ * Lectura periódica única y publicación robusta
  */
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <PubSubClient.h>
+#include <math.h>
+#if MQTT_USE_TLS
+#include <WiFiClientSecure.h>
+#endif
 
-// Configuración WiFi
-const char* ssid = "belkin.3f0";
-const char* password = "6e4496f6";
+// ====== Configuración (sobrescribir con -D en build flags) ======
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
 
-// Configuración IP estática
-IPAddress local_IP(192, 168, 2, 111# Verificar si el dispositivo es detectado
-Get-PnpDevice | Where-Object {$_.FriendlyName -like "*USB*"} | Select-Object Status, Class, FriendlyName);      // IP fija deseada
-IPAddress gateway(192, 168, 2, 1);         // Gateway (router)
-IPAddress subnet(255, 255, 255, 0);        // Máscara de subred
-IPAddress primaryDNS(8, 8, 8, 8);          // DNS primario (Google)
-IPAddress secondaryDNS(8, 8, 4, 4);        // DNS secundario (Google)
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
 
-// Pin donde están conectados los sensores DS18B20 (ambos en el mismo bus)
-#define ONE_WIRE_BUS 4  // GPIO4 en ESP32-S3
+#ifndef WIFI_USE_STATIC_IP
+#define WIFI_USE_STATIC_IP 0
+#endif
 
-// *** CONFIGURACIÓN DE NÚMERO DE SENSORES ***
-#define NRO_SENSORES 1  // Cambia este valor según el número de sensores que uses (1 o 2)
+#ifndef WIFI_LOCAL_IP
+#define WIFI_LOCAL_IP IPAddress(192, 168, 2, 111)
+#endif
+#ifndef WIFI_GATEWAY
+#define WIFI_GATEWAY IPAddress(192, 168, 2, 1)
+#endif
+#ifndef WIFI_SUBNET
+#define WIFI_SUBNET IPAddress(255, 255, 255, 0)
+#endif
+#ifndef WIFI_PRIMARY_DNS
+#define WIFI_PRIMARY_DNS IPAddress(8, 8, 8, 8)
+#endif
+#ifndef WIFI_SECONDARY_DNS
+#define WIFI_SECONDARY_DNS IPAddress(8, 8, 4, 4)
+#endif
 
-// Configurar OneWire para los sensores
+#ifndef MQTT_HOST
+#define MQTT_HOST ""
+#endif
+#ifndef MQTT_PORT
+#define MQTT_PORT 1883
+#endif
+#ifndef MQTT_USERNAME
+#define MQTT_USERNAME ""
+#endif
+#ifndef MQTT_PASSWORD
+#define MQTT_PASSWORD ""
+#endif
+#ifndef MQTT_USE_TLS
+#define MQTT_USE_TLS 0
+#endif
+#ifndef MQTT_BASE_PREFIX
+#define MQTT_BASE_PREFIX "esp-temp"
+#endif
+
+#ifndef ONE_WIRE_BUS
+#define ONE_WIRE_BUS 4
+#endif
+
+#ifndef NRO_SENSORES
+#define NRO_SENSORES 1
+#endif
+
+#ifndef SAMPLE_INTERVAL_MS
+#define SAMPLE_INTERVAL_MS 2000UL
+#endif
+#ifndef MQTT_PUBLISH_INTERVAL_MS
+#define MQTT_PUBLISH_INTERVAL_MS 10000UL
+#endif
+#ifndef HEALTH_PUBLISH_INTERVAL_MS
+#define HEALTH_PUBLISH_INTERVAL_MS 30000UL
+#endif
+#ifndef WIFI_RECONNECT_INTERVAL_MS
+#define WIFI_RECONNECT_INTERVAL_MS 5000UL
+#endif
+#ifndef MQTT_RECONNECT_INTERVAL_MS
+#define MQTT_RECONNECT_INTERVAL_MS 5000UL
+#endif
+#ifndef TEMP_DELTA_THRESHOLD
+#define TEMP_DELTA_THRESHOLD 0.3f
+#endif
+
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+const char* mqttHost = MQTT_HOST;
+const uint16_t mqttPort = MQTT_PORT;
+const char* mqttUsername = MQTT_USERNAME;
+const char* mqttPassword = MQTT_PASSWORD;
+
+IPAddress local_IP = WIFI_LOCAL_IP;
+IPAddress gateway = WIFI_GATEWAY;
+IPAddress subnet = WIFI_SUBNET;
+IPAddress primaryDNS = WIFI_PRIMARY_DNS;
+IPAddress secondaryDNS = WIFI_SECONDARY_DNS;
+
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
-
-// Crear servidor web en el puerto 80
 WebServer server(80);
 
-// Variables globales para almacenar temperatura
-float temperature1C = 0.0;
-float temperature2C = 0.0;
-unsigned long lastUpdate = 0;
-bool sensor1Error = false;
-bool sensor2Error = false;
-int numSensors = 0;
+#if MQTT_USE_TLS
+WiFiClientSecure transportClient;
+#else
+WiFiClient transportClient;
+#endif
+PubSubClient mqttClient(transportClient);
 
-// Función para leer la temperatura
-void updateTemperature() {
-  sensors.requestTemperatures();
-  numSensors = sensors.getDeviceCount();
-  
-  // Leer sensor 1
-  temperature1C = sensors.getTempCByIndex(0);
-  if (temperature1C != DEVICE_DISCONNECTED_C && temperature1C < 85.0 && temperature1C > -55.0) {
-    sensor1Error = false;
-  } else {
-    sensor1Error = true;
-  }
-  
-  // Leer sensor 2 solo si NRO_SENSORES >= 2
-  if (NRO_SENSORES >= 2) {
-    if (numSensors >= 2) {
-      temperature2C = sensors.getTempCByIndex(1);
-      if (temperature2C != DEVICE_DISCONNECTED_C && temperature2C < 85.0 && temperature2C > -55.0) {
-        sensor2Error = false;
-      } else {
-        sensor2Error = true;
-      }
-    } else {
-      sensor2Error = true;
-    }
-  } else {
-    // Si NRO_SENSORES = 1, marcar sensor2 como no usado
-    sensor2Error = true;
-    temperature2C = 0.0;
-  }
-  
-  lastUpdate = millis();
+struct SensorCache {
+  float sensor1C;
+  float sensor2C;
+  bool sensor1Error;
+  bool sensor2Error;
+  int detected;
+  unsigned long sampleMillis;
+};
+
+struct PendingMessage {
+  String topic;
+  String payload;
+  bool retained;
+};
+
+const int OFFLINE_QUEUE_SIZE = 8;
+PendingMessage pendingQueue[OFFLINE_QUEUE_SIZE];
+int pendingStart = 0;
+int pendingCount = 0;
+
+SensorCache current = {0.0f, 0.0f, true, true, 0, 0};
+
+String deviceId;
+String mqttBase;
+String topicAvailability;
+String topicTelemetry;
+String topicSensor1;
+String topicSensor2;
+String topicHealth;
+String topicStatus;
+String topicCmdSampling;
+
+unsigned long lastSampleAt = 0;
+unsigned long lastPublishAt = 0;
+unsigned long lastHealthPublishAt = 0;
+unsigned long lastWifiAttemptAt = 0;
+unsigned long lastMqttAttemptAt = 0;
+unsigned long mqttReconnects = 0;
+unsigned long wifiReconnects = 0;
+unsigned long sensorReadErrors = 0;
+unsigned long sampleIntervalMs = SAMPLE_INTERVAL_MS;
+float lastPublishedTemp1 = NAN;
+float lastPublishedTemp2 = NAN;
+
+void logInfo(const String& msg) { Serial.println("[INFO] " + msg); }
+void logWarn(const String& msg) { Serial.println("[WARN] " + msg); }
+void logError(const String& msg) { Serial.println("[ERROR] " + msg); }
+
+void setCors() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// Página web principal con diseño moderno
-void handleRoot() {
-  String html = "<!DOCTYPE html><html lang='es'><head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<title>Sensor de Temperatura ESP32-S3</title>";
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); margin: 0; padding: 20px; }";
-  html += ".container { max-width: 600px; margin: 0 auto; background: white; border-radius: 20px; padding: 30px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }";
-  html += "h1 { color: #667eea; text-align: center; margin-bottom: 30px; font-size: 28px; }";
-  html += ".sensor-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 15px; text-align: center; margin-bottom: 20px; }";
-  html += ".temperature { font-size: 60px; font-weight: bold; margin: 20px 0; }";
-  html += ".unit { font-size: 30px; }";
-  html += ".info { background: #f5f5f5; padding: 15px; border-radius: 10px; margin-top: 20px; }";
-  html += ".info-row { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #ddd; }";
-  html += ".info-row:last-child { border-bottom: none; }";
-  html += ".label { font-weight: bold; color: #555; }";
-  html += ".value { color: #667eea; }";
-  html += ".error { background: #ff4444; color: white; padding: 15px; border-radius: 10px; text-align: center; }";
-  html += ".refresh-btn { background: #667eea; color: white; border: none; padding: 15px 40px; font-size: 16px; border-radius: 10px; cursor: pointer; margin-top: 20px; width: 100%; }";
-  html += ".refresh-btn:hover { background: #764ba2; }";
-  html += "@media (max-width: 600px) { .temperature { font-size: 48px; } }";
-  html += "</style>";
-  html += "<script>";
-  html += "function refreshData() {";
-  html += "  fetch('/api/temperature').then(r => r.json()).then(data => {";
-  html += "    if(data.error) { document.getElementById('sensor-data').innerHTML = '<div class=\"error\">' + data.message + '</div>'; }";
-  html += "    else { location.reload(); }";
-  html += "  });";
-  html += "}";
-  html += "setInterval(refreshData, 5000);";  // Auto-refresh cada 5 segundos
-  html += "</script>";
-  html += "</head><body>";
-  html += "<div class='container'>";
-  html += "<h1>🌡️ Sensor de Temperatura</h1>";
-  
-  html += "<div id='sensor-data'>";
-  
-  // Sensor 1
-  if (sensor1Error) {
-    html += "<div class='error'>";
-    html += "<h2>⚠️ Error Sensor 1</h2>";
-    html += "<p>No se puede leer la temperatura</p>";
-    html += "</div>";
-  } else {
-    html += "<div class='sensor-card'>";
-    html += "<div>Sensor 1 (GPIO4)</div>";
-    html += "<div class='temperature'>" + String(temperature1C, 1) + "<span class='unit'>°C</span></div>";
-    html += "</div>";
+bool hasMqttConfig() {
+  return String(mqttHost).length() > 0;
+}
+
+bool enqueueMessage(const String& topic, const String& payload, bool retained) {
+  if (pendingCount >= OFFLINE_QUEUE_SIZE) {
+    pendingStart = (pendingStart + 1) % OFFLINE_QUEUE_SIZE;
+    pendingCount--;
   }
-  
-  // Sensor 2 - Solo mostrar si NRO_SENSORES >= 2
+  int idx = (pendingStart + pendingCount) % OFFLINE_QUEUE_SIZE;
+  pendingQueue[idx].topic = topic;
+  pendingQueue[idx].payload = payload;
+  pendingQueue[idx].retained = retained;
+  pendingCount++;
+  return true;
+}
+
+bool publishRaw(const String& topic, const String& payload, bool retained) {
+  return mqttClient.publish(topic.c_str(), payload.c_str(), retained);
+}
+
+bool publishOrQueue(const String& topic, const String& payload, bool retained) {
+  if (mqttClient.connected()) {
+    if (publishRaw(topic, payload, retained)) return true;
+    logWarn("Fallo publish MQTT, encolando mensaje");
+  }
+  return enqueueMessage(topic, payload, retained);
+}
+
+void flushQueue() {
+  while (pendingCount > 0 && mqttClient.connected()) {
+    PendingMessage& m = pendingQueue[pendingStart];
+    if (!publishRaw(m.topic, m.payload, m.retained)) break;
+    pendingStart = (pendingStart + 1) % OFFLINE_QUEUE_SIZE;
+    pendingCount--;
+  }
+}
+
+void acquireTemperatureSample() {
+  sensors.requestTemperatures();
+
+  current.detected = sensors.getDeviceCount();
+  current.sensor1C = sensors.getTempCByIndex(0);
+  current.sensor1Error = !(current.sensor1C != DEVICE_DISCONNECTED_C && current.sensor1C < 85.0f && current.sensor1C > -55.0f);
+
+  if (NRO_SENSORES >= 2 && current.detected >= 2) {
+    current.sensor2C = sensors.getTempCByIndex(1);
+    current.sensor2Error = !(current.sensor2C != DEVICE_DISCONNECTED_C && current.sensor2C < 85.0f && current.sensor2C > -55.0f);
+  } else {
+    current.sensor2C = 0.0f;
+    current.sensor2Error = true;
+  }
+
+  if (current.sensor1Error || (NRO_SENSORES >= 2 && current.sensor2Error)) sensorReadErrors++;
+  current.sampleMillis = millis();
+}
+
+String telemetryJson() {
+  String json = "{";
+  json += "\"deviceId\":\"" + deviceId + "\",";
+  json += "\"timestamp\":" + String(current.sampleMillis) + ",";
+  json += "\"uptimeMs\":" + String(millis()) + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"sensor1\":{";
+  json += "\"error\":" + String(current.sensor1Error ? "true" : "false") + ",";
+  json += "\"temperatureC\":" + String(current.sensor1Error ? 0 : current.sensor1C, 2);
+  json += "}";
   if (NRO_SENSORES >= 2) {
-    if (!sensor2Error) {
-      html += "<div class='sensor-card' style='margin-top: 15px;'>";
-      html += "<div>Sensor 2 (GPIO4)</div>";
-      html += "<div class='temperature'>" + String(temperature2C, 1) + "<span class='unit'>°C</span></div>";
-      html += "</div>";
-    } else {
-      html += "<div class='error' style='margin-top: 15px;'>";
-      html += "<h2>⚠️ Error Sensor 2</h2>";
-      html += "<p>Conecta ambos sensores DATA al pin GPIO4</p>";
-      html += "<p>Cada uno con su resistencia 4.7kΩ</p>";
-      html += "<p>Revisa las conexiones</p>";
-      html += "</div>";
+    json += ",\"sensor2\":{";
+    json += "\"error\":" + String(current.sensor2Error ? "true" : "false") + ",";
+    json += "\"temperatureC\":" + String(current.sensor2Error ? 0 : current.sensor2C, 2);
+    json += "}";
+  }
+  json += ",\"meta\":{";
+  json += "\"configuredSensors\":" + String(NRO_SENSORES) + ",";
+  json += "\"detectedSensors\":" + String(current.detected);
+  json += "}";
+  json += "}";
+  return json;
+}
+
+String sensorJson(int idx) {
+  bool err = idx == 1 ? current.sensor1Error : current.sensor2Error;
+  float temp = idx == 1 ? current.sensor1C : current.sensor2C;
+  String json = "{";
+  json += "\"deviceId\":\"" + deviceId + "\",";
+  json += "\"sensor\":" + String(idx) + ",";
+  json += "\"timestamp\":" + String(current.sampleMillis) + ",";
+  json += "\"unit\":\"C\",";
+  json += "\"error\":" + String(err ? "true" : "false") + ",";
+  json += "\"temperature\":" + String(err ? 0 : temp, 2);
+  json += "}";
+  return json;
+}
+
+String healthJson() {
+  String json = "{";
+  json += "\"deviceId\":\"" + deviceId + "\",";
+  json += "\"uptimeMs\":" + String(millis()) + ",";
+  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"mqttConnected\":" + String(mqttClient.connected() ? "true" : "false") + ",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"wifiReconnects\":" + String(wifiReconnects) + ",";
+  json += "\"mqttReconnects\":" + String(mqttReconnects) + ",";
+  json += "\"sensorReadErrors\":" + String(sensorReadErrors) + ",";
+  json += "\"queueDepth\":" + String(pendingCount) + ",";
+  json += "\"sampleAgeMs\":" + String(millis() - current.sampleMillis);
+  json += "}";
+  return json;
+}
+
+void publishAvailability(const char* state) {
+  if (!hasMqttConfig()) return;
+  publishOrQueue(topicAvailability, String(state), true);
+}
+
+void publishTelemetryIfNeeded() {
+  if (!hasMqttConfig()) return;
+  bool due = (millis() - lastPublishAt) >= MQTT_PUBLISH_INTERVAL_MS;
+  bool changed = (!current.sensor1Error && (isnan(lastPublishedTemp1) || fabs(current.sensor1C - lastPublishedTemp1) >= TEMP_DELTA_THRESHOLD));
+  if (NRO_SENSORES >= 2 && !current.sensor2Error) {
+    changed = changed || (isnan(lastPublishedTemp2) || fabs(current.sensor2C - lastPublishedTemp2) >= TEMP_DELTA_THRESHOLD);
+  }
+
+  if (!due && !changed) return;
+
+  publishOrQueue(topicTelemetry, telemetryJson(), false);
+  publishOrQueue(topicSensor1, sensorJson(1), true);
+  if (NRO_SENSORES >= 2) publishOrQueue(topicSensor2, sensorJson(2), true);
+
+  if (!current.sensor1Error) lastPublishedTemp1 = current.sensor1C;
+  if (NRO_SENSORES >= 2 && !current.sensor2Error) lastPublishedTemp2 = current.sensor2C;
+  lastPublishAt = millis();
+}
+
+void publishHealthIfNeeded() {
+  if (!hasMqttConfig()) return;
+  if ((millis() - lastHealthPublishAt) < HEALTH_PUBLISH_INTERVAL_MS) return;
+  publishOrQueue(topicHealth, healthJson(), true);
+  lastHealthPublishAt = millis();
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String incomingTopic(topic);
+  String body;
+  for (unsigned int i = 0; i < length; i++) body += (char)payload[i];
+  body.trim();
+
+  if (incomingTopic == topicCmdSampling) {
+    unsigned long requested = body.toInt();
+    if (requested >= 1000 && requested <= 60000) {
+      sampleIntervalMs = requested;
+      logInfo("Nuevo sampleIntervalMs=" + String(sampleIntervalMs));
+      publishOrQueue(topicStatus, String("{\"sampleIntervalMs\":") + String(sampleIntervalMs) + "}", true);
     }
   }
-  
-  html += "</div>";
-  
-  html += "<div class='info'>";
-  html += "<div class='info-row'><span class='label'>Estado WiFi:</span><span class='value'>Conectado</span></div>";
-  html += "<div class='info-row'><span class='label'>Red:</span><span class='value'>" + String(ssid) + "</span></div>";
-  html += "<div class='info-row'><span class='label'>IP:</span><span class='value'>" + WiFi.localIP().toString() + "</span></div>";
-  html += "<div class='info-row'><span class='label'>Chip:</span><span class='value'>ESP32-S3</span></div>";
-  html += "<div class='info-row'><span class='label'>Sensores configurados:</span><span class='value'>" + String(NRO_SENSORES) + "</span></div>";
-  html += "<div class='info-row'><span class='label'>Sensores detectados:</span><span class='value'>" + String(numSensors) + "</span></div>";
-  html += "<div class='info-row'><span class='label'>Última lectura:</span><span class='value'>" + String((millis() - lastUpdate) / 1000) + "s</span></div>";
-  html += "</div>";
-  
-  html += "<button class='refresh-btn' onclick='refreshData()'>🔄 Actualizar</button>";
-  html += "</div>";
-  html += "</body></html>";
-  
+}
+
+void connectWiFiNonBlocking() {
+  if (String(ssid).length() == 0) return;
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - lastWifiAttemptAt < WIFI_RECONNECT_INTERVAL_MS) return;
+  lastWifiAttemptAt = millis();
+  wifiReconnects++;
+  logWarn("Intentando reconexión WiFi...");
+
+  WiFi.disconnect();
+#if WIFI_USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
+#endif
+  WiFi.begin(ssid, password);
+}
+
+void connectMqttNonBlocking() {
+  if (!hasMqttConfig()) return;
+  if (WiFi.status() != WL_CONNECTED || mqttClient.connected()) return;
+  if (millis() - lastMqttAttemptAt < MQTT_RECONNECT_INTERVAL_MS) return;
+  lastMqttAttemptAt = millis();
+
+  String willTopic = topicAvailability;
+  String clientId = "esp32-" + deviceId;
+
+  bool connected;
+  if (String(mqttUsername).length() > 0) {
+    connected = mqttClient.connect(clientId.c_str(), mqttUsername, mqttPassword, willTopic.c_str(), 1, true, "offline");
+  } else {
+    connected = mqttClient.connect(clientId.c_str(), willTopic.c_str(), 1, true, "offline");
+  }
+
+  if (connected) {
+    mqttReconnects++;
+    logInfo("MQTT conectado");
+    mqttClient.subscribe(topicCmdSampling.c_str());
+    publishAvailability("online");
+    publishOrQueue(topicStatus, String("{\"sampleIntervalMs\":") + String(sampleIntervalMs) + "}", true);
+    flushQueue();
+  } else {
+    logWarn("MQTT desconectado rc=" + String(mqttClient.state()));
+  }
+}
+
+void handleRoot() {
+  setCors();
+  String html = "<!DOCTYPE html><html lang='es'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>ESP32 Temp Monitor</title><style>body{font-family:Arial;background:#f2f5ff;margin:0;padding:20px}.card{max-width:700px;margin:auto;background:#fff;border-radius:12px;padding:20px;box-shadow:0 8px 24px rgba(0,0,0,.12)}.temp{font-size:48px;color:#2d4ecf}.muted{color:#666}</style></head><body>";
+  html += "<div class='card'><h1>🌡️ ESP32 DS18B20</h1>";
+  html += "<p class='temp'>" + String(current.sensor1Error ? 0 : current.sensor1C, 1) + " °C</p>";
+  if (NRO_SENSORES >= 2) html += "<p class='temp'>S2: " + String(current.sensor2Error ? 0 : current.sensor2C, 1) + " °C</p>";
+  html += "<p class='muted'>IP: " + WiFi.localIP().toString() + " | MQTT: " + String(mqttClient.connected() ? "Conectado" : "Desconectado") + "</p>";
+  html += "<p class='muted'>Dispositivo: " + deviceId + "</p></div></body></html>";
   server.send(200, "text/html", html);
 }
 
-// API endpoint para obtener datos JSON
-void handleAPI() {
-  updateTemperature();
-  
-  String json = "{";
-  json += "\"nroSensoresConfig\": " + String(NRO_SENSORES) + ",";
-  json += "\"numSensorsDetected\": " + String(numSensors) + ",";
-  json += "\"timestamp\": " + String(millis()) + ",";
-  
-  // Sensor 1
-  json += "\"sensor1\": {";
-  if (sensor1Error) {
-    json += "\"error\": true,";
-    json += "\"temperature\": null";
-  } else {
-    json += "\"error\": false,";
-    json += "\"temperature\": " + String(temperature1C, 2);
-  }
-  json += "}";
-  
-  // Sensor 2 - Solo incluir si NRO_SENSORES >= 2
-  if (NRO_SENSORES >= 2) {
-    json += ",\"sensor2\": {";
-    if (sensor2Error) {
-      json += "\"error\": true,";
-      json += "\"temperature\": null";
-    } else {
-      json += "\"error\": false,";
-      json += "\"temperature\": " + String(temperature2C, 2);
-    }
-    json += "}";
-  }
-  
-  json += "}";
-  
-  server.send(200, "application/json", json);
-}
+void handleAPI() { setCors(); server.send(200, "application/json", telemetryJson()); }
+void handleSensor1() { setCors(); server.send(200, "application/json", sensorJson(1)); }
 
-// API endpoint para sensor 1
-void handleSensor1() {
-  updateTemperature();
-  
-  String json = "{";
-  if (sensor1Error) {
-    json += "\"error\": true,";
-    json += "\"temperature\": null";
-  } else {
-    json += "\"error\": false,";
-    json += "\"temperature\": " + String(temperature1C, 2);
-  }
-  json += ",\"timestamp\": " + String(millis());
-  json += "}";
-  
-  server.send(200, "application/json", json);
-}
-
-// API endpoint para sensor 2
 void handleSensor2() {
-  // Solo permitir acceso si NRO_SENSORES >= 2
+  setCors();
   if (NRO_SENSORES < 2) {
-    String json = "{";
-    json += "\"error\": true,";
-    json += "\"message\": \"Sensor 2 no está configurado (NRO_SENSORES=1)\",";
-    json += "\"temperature\": null";
-    json += "}";
-    server.send(400, "application/json", json);
+    server.send(400, "application/json", "{\"error\":true,\"message\":\"Sensor 2 no configurado\"}");
     return;
   }
-  
-  updateTemperature();
-  
-  String json = "{";
-  if (sensor2Error || numSensors < 2) {
-    json += "\"error\": true,";
-    json += "\"temperature\": null";
-  } else {
-    json += "\"error\": false,";
-    json += "\"temperature\": " + String(temperature2C, 2);
-  }
-  json += ",\"timestamp\": " + String(millis());
-  json += "}";
-  
-  server.send(200, "application/json", json);
+  server.send(200, "application/json", sensorJson(2));
 }
 
-// API endpoint simple - solo temperaturas
 void handleSimple() {
-  updateTemperature();
-  
-  String json = "{";
-  json += "\"temp1\": " + String(sensor1Error ? 0 : temperature1C, 2);
-  
-  // Solo incluir temp2 si NRO_SENSORES >= 2
-  if (NRO_SENSORES >= 2) {
-    json += ",\"temp2\": " + String(sensor2Error ? 0 : temperature2C, 2);
-  }
-  
+  setCors();
+  String json = "{\"temp1\":" + String(current.sensor1Error ? 0 : current.sensor1C, 2);
+  if (NRO_SENSORES >= 2) json += ",\"temp2\":" + String(current.sensor2Error ? 0 : current.sensor2C, 2);
   json += "}";
-  
   server.send(200, "application/json", json);
 }
 
-// Página 404
-void handleNotFound() {
-  server.send(404, "text/plain", "404: Página no encontrada");
+void handleHealth() { setCors(); server.send(200, "application/json", healthJson()); }
+void handleNotFound() { setCors(); server.send(404, "text/plain", "404: Página no encontrada"); }
+
+String buildDeviceId() {
+  uint64_t chip = ESP.getEfuseMac();
+  char buff[17];
+  snprintf(buff, sizeof(buff), "%08X", (uint32_t)(chip & 0xFFFFFFFF));
+  return String(buff);
+}
+
+void setupTopics() {
+  mqttBase = String(MQTT_BASE_PREFIX) + "/" + deviceId;
+  topicAvailability = mqttBase + "/availability";
+  topicTelemetry = mqttBase + "/telemetry";
+  topicSensor1 = mqttBase + "/sensor/1";
+  topicSensor2 = mqttBase + "/sensor/2";
+  topicHealth = mqttBase + "/health";
+  topicStatus = mqttBase + "/status";
+  topicCmdSampling = mqttBase + "/cmd/sampling_ms";
 }
 
 void setup() {
-  // Inicializar comunicación serial
   Serial.begin(115200);
   delay(100);
-  
-  Serial.println("\n\nESP32-S3 - Sensor DS18B20 con Web Server");
-  Serial.println("========================================");
-  
-  // Inicializar los sensores DS18B20
-  Serial.println("Iniciando sensores...");
+  Serial.println("\nESP32 DS18B20 HTTP+MQTT");
+
+  deviceId = buildDeviceId();
+  setupTopics();
+
   sensors.begin();
-  
-  Serial.println("Configuración:");
-  Serial.print("- Número de sensores configurado: ");
-  Serial.println(NRO_SENSORES);
-  if (NRO_SENSORES == 1) {
-    Serial.println("- 1 sensor conectado a GPIO4");
-    Serial.println("- Resistencia pull-up 4.7kΩ entre DATA y VCC");
-  } else {
-    Serial.println("- Sensores conectados a GPIO4");
-    Serial.println("- Cada sensor con su resistencia pull-up 4.7kΩ");
-  }
-  Serial.print("- Sensores detectados: ");
-  Serial.println(sensors.getDeviceCount());
-  
-  // Conectar a WiFi
-  Serial.println("\nConectando a WiFi...");
-  Serial.print("SSID: ");
-  Serial.println(ssid);
-  
-  // Configurar IP estática antes de conectar
-  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-    Serial.println("Error al configurar IP estática");
-  }
-  
-  WiFi.begin(ssid, password);
+  acquireTemperatureSample();
+
   WiFi.mode(WIFI_STA);
-  
-  // Esperar conexión
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  Serial.println();
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("¡WiFi conectado exitosamente!");
-    Serial.print("Dirección IP: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("Accede al servidor web en: http://");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("Error: No se pudo conectar a WiFi");
-    Serial.println("Verifica el SSID y la contraseña");
-  }
-  
-  // Configurar rutas del servidor web
+#if WIFI_USE_STATIC_IP
+  WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS);
+#endif
+  if (String(ssid).length() > 0) WiFi.begin(ssid, password);
+
+#if MQTT_USE_TLS
+  transportClient.setInsecure();
+#endif
+  mqttClient.setServer(mqttHost, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+
   server.on("/", handleRoot);
   server.on("/api/temperature", handleAPI);
   server.on("/api/sensor1", handleSensor1);
   server.on("/api/sensor2", handleSensor2);
   server.on("/api/simple", handleSimple);
+  server.on("/api/health", handleHealth);
   server.onNotFound(handleNotFound);
-  
-  // Iniciar servidor
   server.begin();
-  Serial.println("Servidor web iniciado");
-  Serial.println("\nEndpoints API disponibles:");
-  Serial.println("- http://" + WiFi.localIP().toString() + " (interfaz web)");
-  Serial.println("- http://" + WiFi.localIP().toString() + "/api/temperature (datos completos)");
-  Serial.println("- http://" + WiFi.localIP().toString() + "/api/sensor1 (solo sensor 1)");
-  if (NRO_SENSORES >= 2) {
-    Serial.println("- http://" + WiFi.localIP().toString() + "/api/sensor2 (solo sensor 2)");
-  }
-  Serial.println("- http://" + WiFi.localIP().toString() + "/api/simple (formato simple)");
-  Serial.println("========================================\n");
-  
-  // Primera lectura de temperatura
-  updateTemperature();
+
+  logInfo("HTTP listo. DeviceId=" + deviceId);
+  logInfo("Configura WIFI_SSID/WIFI_PASSWORD y MQTT_HOST via build flags.");
 }
 
 void loop() {
-  // Manejar peticiones del servidor web
-  server.handleClient();
-  
-  // Actualizar temperatura cada 2 segundos
-  if (millis() - lastUpdate > 2000) {
-    updateTemperature();
-    
-    // Mostrar en Serial
-    Serial.print("Sensores activos: ");
-    Serial.println(numSensors);
-    
-    if (!sensor1Error) {
-      Serial.print("Sensor 1 (GPIO4): ");
-      Serial.print(temperature1C, 1);
-      Serial.println(" °C");
-    } else {
-      Serial.println("Sensor 1 (GPIO4): Error de lectura");
-    }
-    
-    // Solo mostrar sensor 2 si está configurado
-    if (NRO_SENSORES >= 2) {
-      if (!sensor2Error) {
-        Serial.print("Sensor 2 (GPIO4): ");
-        Serial.print(temperature2C, 1);
-        Serial.println(" °C");
-      } else {
-        Serial.println("Sensor 2 (GPIO4): No detectado");
-      }
-    }
-    
-    Serial.println("---");
+  unsigned long now = millis();
+
+  connectWiFiNonBlocking();
+  connectMqttNonBlocking();
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    flushQueue();
   }
+
+  if (now - lastSampleAt >= sampleIntervalMs) {
+    acquireTemperatureSample();
+    lastSampleAt = now;
+  }
+
+  publishTelemetryIfNeeded();
+  publishHealthIfNeeded();
+
+  server.handleClient();
 }

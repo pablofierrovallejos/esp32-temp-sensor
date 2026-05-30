@@ -1,6 +1,9 @@
 # ESP32-S3 - Sensor de Temperatura DS18B20
 ## Guía de Configuración y Solución de Problemas
 
+> Actualización: el sketch ahora integra MQTT + API HTTP con caché de muestreo periódico.
+> Revisa también el README raíz para el contrato de topics, endpoint `/api/health` y comandos MQTT.
+
 ---
 
 ## 📋 Contenido
